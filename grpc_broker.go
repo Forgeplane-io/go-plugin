@@ -350,6 +350,7 @@ func (b *GRPCBroker) Accept(id uint32) (net.Listener, error) {
 	if b.addrTranslator != nil {
 		advertiseNet, advertiseAddr, err = b.addrTranslator.HostToPlugin(advertiseNet, advertiseAddr)
 		if err != nil {
+			_ = listener.Close()
 			return nil, err
 		}
 	}
@@ -359,6 +360,7 @@ func (b *GRPCBroker) Accept(id uint32) (net.Listener, error) {
 		Address:   advertiseAddr,
 	})
 	if err != nil {
+		_ = listener.Close()
 		return nil, err
 	}
 
