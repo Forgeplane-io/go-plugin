@@ -8,12 +8,12 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-plugin/internal/grpcmux"
 	"github.com/hashicorp/go-plugin/internal/plugin"
 	"github.com/hashicorp/go-plugin/runner"
@@ -262,6 +262,7 @@ func (s *gRPCBrokerClientImpl) Close() {
 type GRPCBroker struct {
 	nextId   uint32
 	streamer streamer
+	logger   hclog.Logger
 	tls      *tls.Config
 	doneCh   chan struct{}
 	o        sync.Once
@@ -285,9 +286,18 @@ type gRPCBrokerPending struct {
 	once   sync.Once
 }
 
-func newGRPCBroker(s streamer, tls *tls.Config, unixSocketCfg UnixSocketConfig, addrTranslator runner.AddrTranslator, muxer grpcmux.GRPCMuxer) *GRPCBroker {
+func newGRPCBroker(logger hclog.Logger, s streamer, tls *tls.Config, unixSocketCfg UnixSocketConfig, addrTranslator runner.AddrTranslator, muxer grpcmux.GRPCMuxer) *GRPCBroker {
+	if logger == nil {
+		logger = hclog.New(&hclog.LoggerOptions{
+			Output: hclog.DefaultOutput,
+			Level:  hclog.Trace,
+			Name:   "plugin",
+		})
+	}
+
 	return &GRPCBroker{
 		streamer: s,
+		logger:   logger,
 		tls:      tls,
 		doneCh:   make(chan struct{}),
 
@@ -309,7 +319,7 @@ func (b *GRPCBroker) Accept(id uint32) (net.Listener, error) {
 		go func() {
 			err := b.listenForKnocks(id)
 			if err != nil {
-				log.Printf("[ERR]: error listening for knocks, id: %d, error: %s", id, err)
+				b.logger.Error("error listening for knocks", "id", id, "error", err)
 			}
 		}()
 
@@ -377,7 +387,7 @@ func (b *GRPCBroker) Accept(id uint32) (net.Listener, error) {
 func (b *GRPCBroker) AcceptAndServe(id uint32, newGRPCServer func([]grpc.ServerOption) *grpc.Server) {
 	ln, err := b.Accept(id)
 	if err != nil {
-		log.Printf("[ERR] plugin: plugin acceptAndServe error: %s", err)
+		b.logger.Error("plugin acceptAndServe error", "error", err)
 		return
 	}
 	defer func() { _ = ln.Close() }()

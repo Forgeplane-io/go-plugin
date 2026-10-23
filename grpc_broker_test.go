@@ -4,17 +4,23 @@
 package plugin
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"os"
 	"runtime/debug"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-plugin/internal/grpcmux"
 	"github.com/hashicorp/go-plugin/internal/plugin"
 	"github.com/hashicorp/go-plugin/runner"
+	"google.golang.org/grpc"
 )
 
 func TestGRPCBroker_AcceptAdvertisementError(t *testing.T) {
@@ -56,7 +62,7 @@ func TestGRPCBroker_AcceptAdvertisementError(t *testing.T) {
 				}}
 			}
 			var muxer *grpcmux.GRPCClientMuxer
-			b := newGRPCBroker(s, nil, brokerTestSocketConfig(t), translator, muxer)
+			b := newGRPCBroker(nil, s, nil, brokerTestSocketConfig(t), translator, muxer)
 			ln, err := b.Accept(1)
 			if ln != nil {
 				_ = ln.Close()
@@ -95,7 +101,7 @@ func TestGRPCBroker_AcceptListenerOwnership(t *testing.T) {
 		return nil
 	}}
 	var muxer *grpcmux.GRPCClientMuxer
-	b := newGRPCBroker(s, nil, brokerTestSocketConfig(t), nil, muxer)
+	b := newGRPCBroker(nil, s, nil, brokerTestSocketConfig(t), nil, muxer)
 	ln, err := b.Accept(1)
 	if err != nil {
 		t.Fatal(err)
@@ -146,4 +152,169 @@ func (t *brokerTestAddrTranslator) HostToPlugin(n, a string) (string, string, er
 
 func (t *brokerTestAddrTranslator) PluginToHost(n, a string) (string, string, error) {
 	return n, a, nil
+}
+
+func TestGRPCBroker_DefaultLogger(t *testing.T) {
+	b := newGRPCBroker(nil, nil, nil, UnixSocketConfig{}, nil, nil)
+	if b.logger == nil || b.logger.Name() != "plugin" || b.logger.GetLevel() != hclog.Trace {
+		t.Fatalf("unexpected default broker logger: %#v", b.logger)
+	}
+}
+
+func TestGRPCBroker_AcceptAndServeLogger(t *testing.T) {
+	for _, owner := range []string{"client", "server"} {
+		for _, level := range []hclog.Level{hclog.Error, hclog.Off} {
+			t.Run(owner+"/"+level.String(), func(t *testing.T) {
+				output := make(brokerTestLogWriter, 16)
+				logger := hclog.New(&hclog.LoggerOptions{Level: level, Output: output, JSONFormat: true})
+				b := brokerTestOwnedBroker(t, owner, logger, false)
+				stdlib := make(brokerTestLogWriter, 16)
+				oldOutput := log.Writer()
+				log.SetOutput(stdlib)
+				defer log.SetOutput(oldOutput)
+
+				if err := b.Close(); err != nil {
+					t.Fatal(err)
+				}
+				b.AcceptAndServe(1, func(opts []grpc.ServerOption) *grpc.Server {
+					t.Error("server factory called after failed Accept")
+					return grpc.NewServer(opts...)
+				})
+
+				select {
+				case entry := <-stdlib:
+					t.Errorf("unexpected stdlib log output: %s", entry)
+				default:
+				}
+				select {
+				case entry := <-output:
+					if level == hclog.Off {
+						t.Errorf("disabled logger received output: %s", entry)
+					} else {
+						brokerTestErrorLog(t, entry, "plugin acceptAndServe error", "broker closed")
+					}
+				default:
+					if level != hclog.Off {
+						t.Error("broker error did not reach the owning hclog logger")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestGRPCBroker_KnockErrorLogger(t *testing.T) {
+	for _, owner := range []string{"client", "server"} {
+		t.Run(owner, func(t *testing.T) {
+			output := make(brokerTestLogWriter, 16)
+			logger := hclog.New(&hclog.LoggerOptions{Level: hclog.Error, Output: output, JSONFormat: true})
+			b := brokerTestOwnedBroker(t, owner, logger, true)
+			stdlib := make(brokerTestLogWriter, 16)
+			oldOutput := log.Writer()
+			log.SetOutput(stdlib)
+			defer log.SetOutput(oldOutput)
+
+			// An invalid knock exercises the asynchronous broker error path
+			// without opening a connection on this listener.
+			const id = 42
+			ln, err := b.Accept(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			b.getServerStream(id).ch <- &plugin.ConnInfo{ServiceId: id}
+
+			select {
+			case entry := <-output:
+				fields := brokerTestErrorLog(t, entry, "error listening for knocks", "knock received for service ID 42 with incorrect values; knock=<nil>")
+				if fields["id"] != float64(id) {
+					t.Errorf("knock log lost stream ID: %s", entry)
+				}
+			case entry := <-stdlib:
+				t.Errorf("broker error went to stdlib instead of hclog: %s", entry)
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for knock error log")
+			}
+			select {
+			case entry := <-stdlib:
+				t.Errorf("unexpected stdlib log output: %s", entry)
+			default:
+			}
+		})
+	}
+}
+
+// Exercise the real client and server construction sites with distinct loggers.
+func brokerTestOwnedBroker(t *testing.T, owner string, logger hclog.Logger, multiplex bool) *GRPCBroker {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	clientLogger, serverLogger := hclog.NewNullLogger(), hclog.NewNullLogger()
+	if owner == "client" {
+		clientLogger = logger
+	} else {
+		serverLogger = logger
+	}
+	var muxer *grpcmux.GRPCServerMuxer
+	var serverListener net.Listener = ln
+	if multiplex {
+		muxer = grpcmux.NewGRPCServerMuxer(serverLogger, ln)
+		serverListener = muxer
+	}
+	s := &GRPCServer{
+		Server: DefaultGRPCServer,
+		DoneCh: make(chan struct{}),
+		Stdout: strings.NewReader(""),
+		Stderr: strings.NewReader(""),
+		logger: serverLogger,
+		muxer:  muxer,
+	}
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Stop)
+	go s.Serve(serverListener)
+	c := NewClient(&ClientConfig{Logger: clientLogger, GRPCBrokerMultiplex: multiplex})
+	c.address, c.protocol = ln.Addr(), ProtocolGRPC
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	client, err := newGRPCClient(ctx, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = client.broker.Close()
+		_ = client.Conn.Close()
+		if multiplex {
+			_ = c.grpcMuxer.Close()
+		}
+	})
+	b := s.broker
+	if owner == "client" {
+		b = client.broker
+	}
+	b.unixSocketCfg = brokerTestSocketConfig(t)
+	return b
+}
+
+type brokerTestLogWriter chan string
+
+func (w brokerTestLogWriter) Write(p []byte) (int, error) {
+	w <- string(p)
+	return len(p), nil
+}
+
+func brokerTestErrorLog(t *testing.T, entry, message, errText string) map[string]interface{} {
+	t.Helper()
+	var fields map[string]interface{}
+	if err := json.Unmarshal([]byte(entry), &fields); err != nil {
+		t.Fatalf("invalid hclog JSON: %s", err)
+	}
+	if fields["@level"] != "error" || fields["@message"] != message || fields["error"] != errText {
+		t.Errorf("unexpected broker error log: %s", entry)
+	}
+	return fields
 }

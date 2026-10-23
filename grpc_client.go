@@ -68,7 +68,7 @@ func newGRPCClient(doneCtx context.Context, c *Client) (*GRPCClient, error) {
 
 	// Start the broker.
 	brokerGRPCClient := newGRPCBrokerClient(conn)
-	broker := newGRPCBroker(brokerGRPCClient, c.config.TLSConfig, c.unixSocketCfg, c.runner, muxer)
+	broker := newGRPCBroker(c.logger, brokerGRPCClient, c.config.TLSConfig, c.unixSocketCfg, c.runner, muxer)
 	go broker.Run()
 	go func() { _ = brokerGRPCClient.StartStream() }()
 
